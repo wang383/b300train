@@ -6,15 +6,18 @@
 |------|-----|
 | EC2 实例类型 | p6-b300.48xlarge |
 | 支持实例 | G4dn, G5, G6, Gr6, G6e, P4d, P4de, P5, P5e, P5en, P6-B200, P6-B300 |
-| 操作系统 | Ubuntu 22.04.5 LTS |
+| **DLAMI 名称** | **Deep Learning Base AMI with Single CUDA (Ubuntu 24.04) 20260415** |
+| **AMI ID** | **ami-022980e1521627a03** |
+| **DLAMI 创建日期** | **2026-04-16** |
+| 操作系统 | Ubuntu 24.04.4 LTS (Noble Numbat) |
 | 架构 | x86_64 |
 | 内核版本 | 6.8.0-1050-aws |
 | Python | /usr/bin/python3.10 |
-| NVIDIA 驱动 | 580.126.09（nvidia-smi 显示 595.58.03） |
-| CUDA | /usr/local/cuda-13.0（CUDA 13.2） |
+| NVIDIA 驱动 | 595.58.03 |
+| CUDA | /usr/local/cuda-13.2（CUDA 13.2.20260303） |
 | nvidia-container-toolkit | 1.19.0 |
 | DCGM | 4.5.2 |
-| EFA 版本 | 1.45.0 |
+| EFA 版本 | 1.45.0（libfabric 2.4.0amzn1.0） |
 | OFI-NCCL 版本 | 1.17.2 |
 | NVMe 挂载点 | /opt/dlami/nvme（28TB LVM，8x NVMe 组成） |
 | EBS 类型 | gp3 |
