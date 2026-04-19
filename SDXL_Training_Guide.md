@@ -402,3 +402,106 @@ for batch in dataloader:
 **非瓶颈（无需优化）：**
 - NCCL 同步仅 12ms（3%）：EFA 通信效率高
 - 数据加载仅 1ms（<1%）：NVMe 读取速度充足
+
+---
+
+## 多节点训练（16卡，2台机器）
+
+### 前提条件
+
+- 两台相同的 p6-b300.48xlarge 实例
+- 同一 VPC 和子网（建议同一 Placement Group）
+- 安全组允许两台机器互相访问（至少开放 TCP 29500）
+- 两台机器都已完成前面的环境准备步骤（拉取镜像、准备目录）
+
+### 数据同步
+
+两台机器都需要有模型和数据集缓存，最简单的方式是在节点2上重新运行一次训练让它自动下载，或从节点1同步：
+
+```bash
+# 在节点1执行，将缓存同步到节点2
+rsync -avz /opt/dlami/nvme/cache/ ubuntu@<节点2_IP>:/opt/dlami/nvme/cache/
+```
+
+### 启动脚本
+
+**节点1（主节点，先启动）：**
+
+```bash
+MASTER_IP=<节点1_内网IP>
+
+docker run --rm \
+  --runtime=nvidia --gpus all \
+  --shm-size=512g --ulimit memlock=-1 \
+  --network=host \
+  --device /dev/infiniband/uverbs0 --device /dev/infiniband/uverbs1 \
+  --device /dev/infiniband/rdma_cm --device /dev/infiniband/umad0 --device /dev/infiniband/umad1 \
+  -v /opt/amazon/ofi-nccl:/opt/amazon/ofi-nccl \
+  -v /opt/amazon/efa:/opt/amazon/efa \
+  -v /opt/dlami/nvme/sdxl:/workspace \
+  -v /opt/dlami/nvme/cache:/root/.cache \
+  -e LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:/usr/local/cuda/lib64:/usr/local/lib \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  -e HF_HOME=/root/.cache/huggingface \
+  -e NCCL_DEBUG=WARN \
+  763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2 \
+  bash -c "
+    pip install diffusers transformers datasets bitsandbytes -q
+    pip install git+https://github.com/huggingface/diffusers.git -q
+
+    cat > /tmp/accelerate_config.yaml << 'EOF'
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+machine_rank: 0
+num_machines: 2
+num_processes: 16
+main_process_ip: ${MASTER_IP}
+main_process_port: 29500
+mixed_precision: bf16
+same_network: true
+use_cpu: false
+EOF
+
+    accelerate launch \
+      --config_file /tmp/accelerate_config.yaml \
+      /workspace/train_instruct_pix2pix_sdxl.py \
+      --pretrained_model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+      --dataset_name fusing/instructpix2pix-1000-samples \
+      --use_ema \
+      --resolution 1024 \
+      --train_batch_size 2 \
+      --gradient_accumulation_steps 4 \
+      --gradient_checkpointing \
+      --max_train_steps 500 \
+      --learning_rate 5e-6 \
+      --lr_scheduler cosine \
+      --lr_warmup_steps 50 \
+      --mixed_precision bf16 \
+      --output_dir /workspace/checkpoints \
+      --checkpointing_steps 100 \
+      --seed 42 \
+      2>&1 | tee /workspace/train.log
+  "
+```
+
+**节点2（后启动，仅 `machine_rank` 不同）：**
+
+将上面脚本中 `machine_rank: 0` 改为 `machine_rank: 1`，其余完全相同。
+
+### 关键参数对比
+
+| 参数 | 单节点（8卡） | 双节点（16卡） |
+|------|-------------|--------------|
+| `num_machines` | 1 | 2 |
+| `num_processes` | 8 | 16 |
+| `machine_rank` | 0 | 节点1=0，节点2=1 |
+| `main_process_ip` | 不需要 | 节点1的内网 IP |
+| `main_process_port` | 不需要 | 29500 |
+| 全局 batch size | 2×8×4=64 | 2×16×4=128 |
+
+### 注意事项
+
+1. **启动顺序**：先启动节点1，再启动节点2，节点2 会等待节点1 的 rendezvous
+2. **Checkpoint 只保存在节点1**（rank 0），节点2 不写 checkpoint
+3. **EFA 跨节点通信**：`FI_EFA_USE_DEVICE_RDMA=1` 已设置，NCCL 自动通过 EFA 做跨节点 all-reduce，无需额外配置
+4. **共享存储（推荐）**：生产环境建议挂载 FSx for Lustre，两台机器共享同一数据集和 checkpoint 目录，避免手动同步
