@@ -1,5 +1,34 @@
 # SDXL InstructPix2Pix 训练完整指南
 
+## 从 Capacity Reservations 中启动 B300
+
+在启动 p6-b300.48xlarge 实例之前，需要先通过 Capacity Reservations 预留容量，确保实例可用，然后 launch instance。
+
+![从 Capacity Reservations 启动 B300 实例](iShot_2026-04-19_17.21.56.png)
+
+进入 launch instance 配置，推荐选择 AWS DLAMI（Deep Learning AMI），已预装 CUDA、驱动及深度学习框架，开箱即用。
+
+![选择 AWS DLAMI](iShot_2026-04-19_17.25.32.png)
+
+选择机型 p6-b300.48xlarge，默认应该就是这个机型。
+
+![选择 p6-b300.48xlarge 机型](iShot_2026-04-19_17.26.12.png)
+
+选择网络环境，subnet 必须和购买的 Capacity Reservation 在同一个 AZ，可以在购买的 CB 中查询，例如 us-west-2。
+
+![选择网络环境和 Subnet](iShot_2026-04-19_17.28.12.png)
+
+根据需求选择 EBS 磁盘大小，建议 500G 以上。需要注意的是 B300 机型自带高效的 28T NVMe 存储，建议将训练数据放在 NVMe 存储上以获得更好的 I/O 性能，但关机后数据会消失，重要数据需及时备份到 S3。
+
+![选择 EBS 磁盘大小](iShot_2026-04-19_18.31.43.png)
+
+通过 SSH 或 SSM 登录机器如下，SSM 登录需要给 EC2 赋予必要的 IAM 权限（如 `AmazonSSMManagedInstanceCore` 策略）。
+
+![SSH 或 SSM 登录机器](iShot_2026-04-19_17.51.19.png)
+
+---
+
+
 ## 环境信息
 
 | 项目 | 值 |
