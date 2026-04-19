@@ -505,3 +505,140 @@ EOF
 2. **Checkpoint 只保存在节点1**（rank 0），节点2 不写 checkpoint
 3. **EFA 跨节点通信**：`FI_EFA_USE_DEVICE_RDMA=1` 已设置，NCCL 自动通过 EFA 做跨节点 all-reduce，无需额外配置
 4. **共享存储（推荐）**：生产环境建议挂载 FSx for Lustre，两台机器共享同一数据集和 checkpoint 目录，避免手动同步
+
+---
+
+## 优化训练：提升 SM 利用率（batch_size=8）
+
+### 为什么做这次优化测试
+
+第一次训练（batch_size=2）完成后，通过 profiling 和 SM 利用率监控发现：
+
+- SM 平均利用率只有 **56%**，约一半的 SM 在等待
+- 每步耗时 **4.2 秒**，其中 VAE 编码占 30%，反向传播占 34%
+- 显存每张 GPU 只用了 161GB，剩余 **110GB 完全空闲**
+
+根本原因：`batch_size=2` 太小，每次只给 GPU 喂 2 张图，148 个 SM 大量空转。
+
+**优化目标**：在不改变全局 batch size（64）的前提下，把 `batch_size` 从 2 提升到 8，同时去掉梯度累积（`gradient_accumulation_steps` 从 4 改为 1），让每步计算量更大，充分利用 SM。
+
+### 优化脚本
+
+文件：`run_sdxl_i2i_optimized.sh`
+
+与原始脚本的差异：
+
+| 参数 | 原始值 | 优化值 | 说明 |
+|------|--------|--------|------|
+| `--train_batch_size` | 2 | **8** | 每 GPU batch 扩大 4 倍 |
+| `--gradient_accumulation_steps` | 4 | **1** | 取消梯度累积，每步直接更新 |
+| `--dataloader_num_workers` | 未设置 | **0** | 该脚本在 DataLoader worker 中调用 CUDA，num_workers>0 会报错 |
+
+全局 batch size 保持不变：`8 × 8 GPU × 1 = 64`
+
+```bash
+#!/bin/bash
+set -e
+
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')" \
+  http://169.254.169.254/latest/meta-data/placement/region)
+
+IMAGE="763104351884.dkr.ecr.${REGION}.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2"
+WORK_DIR="/opt/dlami/nvme/sdxl_opt"
+mkdir -p ${WORK_DIR}/{checkpoints,logs}
+cp /opt/dlami/nvme/sdxl/train_instruct_pix2pix_sdxl.py ${WORK_DIR}/
+
+docker run --rm \
+  --runtime=nvidia --gpus all \
+  --shm-size=512g --ulimit memlock=-1 --ulimit stack=67108864 \
+  --network=host \
+  --device /dev/infiniband/uverbs0 --device /dev/infiniband/uverbs1 \
+  --device /dev/infiniband/rdma_cm --device /dev/infiniband/umad0 --device /dev/infiniband/umad1 \
+  -v /opt/amazon/ofi-nccl:/opt/amazon/ofi-nccl \
+  -v /opt/amazon/efa:/opt/amazon/efa \
+  -v ${WORK_DIR}:/workspace \
+  -v /opt/dlami/nvme/cache:/root/.cache \
+  -e LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:/usr/local/cuda/lib64:/usr/local/lib \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  -e HF_HOME=/root/.cache/huggingface \
+  -e NCCL_DEBUG=WARN \
+  -e OMP_NUM_THREADS=8 \
+  ${IMAGE} \
+  bash -c "
+    pip install accelerate transformers datasets bitsandbytes -q &&
+    pip install git+https://github.com/huggingface/diffusers.git -q &&
+
+    cat > /tmp/accelerate_config.yaml << 'EOF'
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+EOF
+
+    accelerate launch \
+      --config_file /tmp/accelerate_config.yaml \
+      /workspace/train_instruct_pix2pix_sdxl.py \
+      --pretrained_model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+      --dataset_name fusing/instructpix2pix-1000-samples \
+      --use_ema \
+      --resolution 1024 \
+      --train_batch_size 8 \
+      --dataloader_num_workers 0 \
+      --gradient_accumulation_steps 1 \
+      --gradient_checkpointing \
+      --max_train_steps 500 \
+      --learning_rate 5e-6 \
+      --lr_scheduler cosine \
+      --lr_warmup_steps 50 \
+      --mixed_precision bf16 \
+      --output_dir /workspace/checkpoints \
+      --report_to tensorboard \
+      --logging_dir /workspace/logs \
+      --checkpointing_steps 100 \
+      --seed 42 \
+      2>&1 | tee /workspace/train.log
+  "
+```
+
+### 遇到的问题
+
+**问题：`--dataloader_num_workers 16` 报错**
+
+```
+RuntimeError: Cannot re-initialize CUDA in forked subprocess.
+To use CUDA with multiprocessing, you must use the 'spawn' start method
+```
+
+原因：`train_instruct_pix2pix_sdxl.py` 在 DataLoader 的 `preprocess_train` 函数中调用了 CUDA（文本编码），而 DataLoader 的 worker 进程是通过 `fork` 创建的，fork 后不能重新初始化 CUDA。
+
+解决：设置 `--dataloader_num_workers 0`，在主进程中处理数据，避免 fork。
+
+### 优化结果对比
+
+| 指标 | 原始（batch=2, accum=4） | 优化（batch=8, accum=1） | 提升 |
+|------|------------------------|------------------------|------|
+| 每步耗时 | 4.2 s/step | **1.76 s/step** | **2.4x 加速** |
+| 总训练时间（500 steps） | 35 分 13 秒 | **17 分 56 秒** | **节省 49%** |
+| 全局 batch size | 64 | 64 | 相同 |
+| SM 利用率（峰值） | 100% | 100% | 相同 |
+| 内存带宽利用率 | ~7% | **~36~60%** | 大幅提升 |
+| 显存使用 | ~161 GB/GPU | 更高（batch 更大） | — |
+
+### 关键结论
+
+1. **batch_size 是影响训练效率的最关键参数**：从 2 提升到 8，训练速度提升 2.4 倍，总时间从 35 分钟缩短到 18 分钟
+2. **全局 batch size 不变，但去掉梯度累积更高效**：梯度累积会引入额外的串行等待，直接用大 batch 让每步计算更密集
+3. **内存带宽利用率从 7% 提升到 36~60%**：说明 GPU 的 HBM3e 高带宽内存得到了更充分的利用
+4. **`dataloader_num_workers` 限制**：该训练脚本因在 DataLoader worker 中调用 CUDA，只能设为 0，数据加载在主进程完成。由于数据集较小（398MB，NVMe 读取 <1ms），这不是瓶颈
