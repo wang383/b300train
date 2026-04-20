@@ -2,7 +2,7 @@
 
 ## 从 Capacity Reservations 中启动 B300
 
-在启动 p6-b300.48xlarge 实例之前，需要先通过 Capacity Reservations 预留容量，确保实例可用，然后 launch instance。
+方法在启动 p6-b300.48xlarge 实例之前，需要先通过 Capacity Reservations 预留容量，确保实例可用，然后 launch instance。
 
 ![从 Capacity Reservations 启动 B300 实例](iShot_2026-04-19_17.21.56.png)
 
@@ -17,6 +17,75 @@
 选择网络环境，subnet 必须和购买的 Capacity Reservation 在同一个 AZ，可以在购买的 CB 中查询，例如 us-west-2。
 
 ![选择网络环境和 Subnet](iShot_2026-04-19_17.28.12.png)
+
+### 网络接口配置（使用案例1）
+
+共需添加 17 个接口，合计 18 个网络接口。
+
+**已有的主接口（不用动）：**
+
+- Network card index: 0
+- Device index: 0
+- Interface type: ENA（默认）
+
+---
+
+点 "Add network interface"，添加以下接口：
+
+**第1个：**
+
+- Network card index: 0
+- Device index: 1
+- Interface type: EFA Only
+
+**第2~17个（重复16次，Network card index 从1加到16）：**
+
+- Network card index: 1（下一个填2，以此类推到16）
+- Device index: 0
+- Interface type: EFA Only
+
+每次都要选相同的 Subnet 和 Security group。
+
+---
+
+填完后检查，总共应该是：
+
+- 1 个 ENA（主接口）
+- 17 个 EFA Only
+- 合计 18 个网络接口
+
+![网络接口配置完成](iShot_2026-04-20_09.35.03.png)
+
+> **提示：** 由于 p6-b300.48xlarge 网卡数量多，手动在控制台逐个添加接口容易出错，**推荐使用 AWS CLI `run-instances` 命令一次性指定所有网络接口**，更高效且不易遗漏。参考文档：[使用多网卡最大化 Amazon EC2 实例上的网络带宽](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/efa-acc-inst-types.html)
+
+以下为对应使用案例1（18个接口：1个ENA + 17个EFA Only）的 CLI 示例：
+
+```bash
+aws ec2 run-instances \
+  --instance-type p6-b300.48xlarge \
+  --count 1 \
+  --key-name <key_pair_name> \
+  --image-id <ami_id> \
+  --network-interfaces \
+    "NetworkCardIndex=0,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=interface" \
+    "NetworkCardIndex=0,DeviceIndex=1,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=1,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=2,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=3,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=4,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=5,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=6,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=7,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=8,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=9,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=10,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=11,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=12,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=13,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=14,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=15,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only" \
+    "NetworkCardIndex=16,DeviceIndex=0,Groups=<security_group_id>,SubnetId=<subnet_id>,InterfaceType=efa-only"
+```
 
 根据需求选择 EBS 磁盘大小，建议 500G 以上。需要注意的是 B300 机型自带高效的 28T NVMe 存储，建议将训练数据放在 NVMe 存储上以获得更好的 I/O 性能，但关机后数据会消失，重要数据需及时备份到 S3。
 
