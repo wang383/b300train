@@ -436,3 +436,127 @@ docker push $ECR_URI
 ```
 940482411881.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-efa:2.10.0-cu130-ubuntu22.04
 ```
+
+---
+
+## 十、glibc 版本分析与最终解决方案
+
+### 版本对比
+
+| 环境 | OS | glibc 版本 |
+|------|-----|-----------|
+| EC2 宿主机 | Ubuntu 24.04 | **2.39** |
+| 容器镜像（pytorch-training:2.10.0...ubuntu22.04） | Ubuntu 22.04 | **2.35** |
+| 宿主机 ofi-nccl 1.18.0（`/opt/amazon/ofi-nccl`） | 为 Ubuntu 24.04 编译 | 要求 **≥ 2.38** |
+| 自建镜像内置 ofi-nccl 1.19.0（Ubuntu 22.04 专用） | 为 Ubuntu 22.04 编译 | 要求 **≥ 2.16** ✅ |
+
+### 问题链路
+
+```
+宿主机 ofi-nccl 1.18.0 (需要 glibc 2.38)
+    挂载进容器 (-v /opt/amazon/ofi-nccl:/opt/amazon/ofi-nccl)
+        容器内 glibc 只有 2.35
+            → libnccl-net.so 加载失败
+                → NCCL 回退到 TCP Socket (NET/Socket)
+                    → 跨节点通信走 ENA 网卡，带宽极低
+```
+
+### 解决方案
+
+不挂载宿主机的 ofi-nccl，改用自建镜像内置的 Ubuntu 22.04 专用版本（ofi-nccl 1.19.0，最高依赖 glibc 2.16）。
+
+**关键：使用新镜像时不能挂载 `/opt/amazon/efa`**，否则宿主机的 libfabric.so（需要 glibc 2.38）会覆盖镜像内兼容的版本，导致同样的问题。
+
+### 验证结果
+
+```
+# NCCL_DEBUG=INFO 输出确认走 EFA：
+NET/Plugin: Loaded net plugin Libfabric (v11)
+NET/OFI Initializing aws-ofi-nccl 1.19.0
+NET/OFI Using Libfabric version 2.4
+NET/OFI Plugin selected platform: AWS
+NET/OFI Using transport protocol RDMA (platform set)
+NET/OFI Selected provider is efa, fabric is efa-direct (found 16 nics)
+
+# EFA 带宽监控确认（训练中）：
+rdmap101s0   27.39 Gbps TX   27.39 Gbps RX
+rdmap102s0   27.39 Gbps TX   27.39 Gbps RX
+... (16卡全部活跃，总计 ~438 Gbps 双向)
+```
+
+---
+
+## 十一、最终训练启动命令
+
+### 节点2 先启动（通过 SSM）
+
+```bash
+NEW_IMAGE="940482411881.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-efa:2.10.0-cu130-ubuntu22.04"
+IB_DEVICES=$(ls /dev/infiniband/ | grep -v "^by-" | sed 's|^|--device /dev/infiniband/|' | tr '\n' ' ')
+
+nohup docker run --rm \
+  --runtime=nvidia --gpus all \
+  --network=host \
+  --shm-size=512g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  $IB_DEVICES \
+  -v /opt/dlami/nvme/sdxl:/workspace \
+  -v /opt/dlami/nvme/cache:/root/.cache \
+  -v /opt/dlami/nvme/benchmark/config:/config \
+  -v /opt/dlami/nvme/benchmark/train_node2_inner.sh:/train.sh \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  -e FI_EFA_FORK_SAFE=1 \
+  -e NCCL_SOCKET_IFNAME=enp71s0 \
+  -e NCCL_IB_HCA=rdmap \
+  -e NCCL_DEBUG=WARN \
+  -e NCCL_P2P_DISABLE=1 \
+  -e HF_HOME=/root/.cache/huggingface \
+  -e OMP_NUM_THREADS=8 \
+  $NEW_IMAGE \
+  bash /train.sh \
+  > /opt/dlami/nvme/sdxl/train_node2.log 2>&1 &
+```
+
+### 节点1 随后启动（主节点，本机执行）
+
+```bash
+NEW_IMAGE="940482411881.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-efa:2.10.0-cu130-ubuntu22.04"
+IB_DEVICES=$(ls /dev/infiniband/ | grep -v "^by-" | sed 's|^|--device /dev/infiniband/|' | tr '\n' ' ')
+
+nohup docker run --rm \
+  --runtime=nvidia --gpus all \
+  --network=host \
+  --shm-size=512g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  $IB_DEVICES \
+  -v /opt/dlami/nvme/sdxl:/workspace \
+  -v /opt/dlami/nvme/cache:/root/.cache \
+  -v /opt/dlami/nvme/benchmark/config:/config \
+  -v /opt/dlami/nvme/benchmark/train_node1_inner.sh:/train.sh \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  -e FI_EFA_FORK_SAFE=1 \
+  -e NCCL_SOCKET_IFNAME=enp71s0 \
+  -e NCCL_IB_HCA=rdmap \
+  -e NCCL_DEBUG=WARN \
+  -e NCCL_P2P_DISABLE=1 \
+  -e HF_HOME=/root/.cache/huggingface \
+  -e OMP_NUM_THREADS=8 \
+  $NEW_IMAGE \
+  bash /train.sh \
+  > /opt/dlami/nvme/sdxl/train_node1.log 2>&1 &
+```
+
+### 两个命令的唯一区别
+
+| | 节点1 | 节点2 |
+|--|--|--|
+| 挂载脚本 | `train_node1_inner.sh` | `train_node2_inner.sh` |
+| accelerate config | machine_rank=0，主节点 | machine_rank=1 |
+| 其他所有参数 | 完全相同 | 完全相同 |
+
+### 注意事项
+
+1. **不挂载** `/opt/amazon/efa` 和 `/opt/amazon/ofi-nccl`（用镜像内置版本）
+2. **不设置** `LD_LIBRARY_PATH` 中的 efa/ofi-nccl 路径
+3. 先启动节点2，再启动节点1（节点1作为 rendezvous server 等待节点2连接）
+4. 节点2需在节点1启动后 15 分钟内完成 pip 安装并连接
