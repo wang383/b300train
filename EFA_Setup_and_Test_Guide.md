@@ -1,4 +1,4 @@
-# p6-b300 双机 EFA 配置与测试指南
+# p6-b300 双机 EFA 配置、测试与训练完整指南
 
 ## 环境信息
 
@@ -9,6 +9,7 @@
 | AZ | us-west-2a | us-west-2a |
 | 安全组 | sg-0957308fc5a969ef0 (efa-nccl-sg) | 同一安全组 |
 | ENA 网卡名 | enp71s0 | enp71s0 |
+| AWS Profile | myb300 | myb300（通过 SSM 操作） |
 
 ---
 
@@ -167,9 +168,176 @@ EFA all_reduce test PASSED
 
 ---
 
-## 五、故障排查
+## 五、SDXL 双机训练
 
-### IBV_WC_REM_ACCESS_ERR
+### 训练镜像
+
+```
+763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2
+```
+
+拉取镜像（两台机器都执行）：
+```bash
+aws ecr get-login-password --region us-west-2 --profile myb300 | \
+  docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-west-2.amazonaws.com
+docker pull 763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2
+```
+
+### 准备目录（两台机器都执行）
+
+```bash
+mkdir -p /opt/dlami/nvme/sdxl/{checkpoints,logs}
+mkdir -p /opt/dlami/nvme/cache
+mkdir -p /opt/dlami/nvme/benchmark/config
+```
+
+### accelerate 配置文件
+
+**节点1** `/opt/dlami/nvme/benchmark/config/accelerate_node1.yaml`：
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+machine_rank: 0
+num_machines: 2
+num_processes: 16
+main_process_ip: 172.31.47.177
+main_process_port: 29500
+mixed_precision: bf16
+same_network: true
+use_cpu: false
+```
+
+**节点2** `/opt/dlami/nvme/benchmark/config/accelerate_node2.yaml`：
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+machine_rank: 1
+num_machines: 2
+num_processes: 16
+main_process_ip: 172.31.47.177
+main_process_port: 29500
+mixed_precision: bf16
+same_network: true
+use_cpu: false
+```
+
+### 训练内部脚本
+
+**节点1** `/opt/dlami/nvme/benchmark/train_node1_inner.sh`：
+```bash
+#!/bin/bash
+set -e
+python -m pip install -q accelerate transformers datasets bitsandbytes
+python -m pip install -q git+https://github.com/huggingface/diffusers.git
+
+wget -q https://raw.githubusercontent.com/huggingface/diffusers/main/examples/instruct_pix2pix/train_instruct_pix2pix_sdxl.py \
+  -O /workspace/train_instruct_pix2pix_sdxl.py
+
+accelerate launch --config_file /config/accelerate_node1.yaml \
+  /workspace/train_instruct_pix2pix_sdxl.py \
+  --pretrained_model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+  --dataset_name fusing/instructpix2pix-1000-samples \
+  --use_ema --resolution 1024 --train_batch_size 2 \
+  --gradient_accumulation_steps 4 --gradient_checkpointing \
+  --max_train_steps 500 --learning_rate 5e-6 \
+  --lr_scheduler cosine --lr_warmup_steps 50 --mixed_precision bf16 \
+  --output_dir /workspace/checkpoints --report_to tensorboard \
+  --logging_dir /workspace/logs --checkpointing_steps 100 --seed 42 \
+  2>&1 | tee /workspace/train.log
+```
+
+**节点2** `/opt/dlami/nvme/benchmark/train_node2_inner.sh`：与节点1相同，`--config_file` 改为 `/config/accelerate_node2.yaml`，日志改为 `/workspace/train_node2.log`。
+
+### 启动训练
+
+获取 infiniband 设备列表（两台机器执行方式相同）：
+```bash
+IB_DEVICES=$(ls /dev/infiniband/ | grep -v "^by-" | sed 's|^|--device /dev/infiniband/|' | tr '\n' ' ')
+```
+
+**先启动节点2**（通过 SSM），**再启动节点1**：
+
+```bash
+# 节点1启动命令（节点2同理，替换 node_rank 和脚本路径）
+nohup docker run --rm \
+  --runtime=nvidia --gpus all \
+  --network=host \
+  --shm-size=512g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  $IB_DEVICES \
+  -v /opt/amazon/ofi-nccl:/opt/amazon/ofi-nccl \
+  -v /opt/amazon/efa:/opt/amazon/efa \
+  -v /opt/dlami/nvme/sdxl:/workspace \
+  -v /opt/dlami/nvme/cache:/root/.cache \
+  -v /opt/dlami/nvme/benchmark/config:/config \
+  -v /opt/dlami/nvme/benchmark/train_node1_inner.sh:/train.sh \
+  -e LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:/usr/local/cuda/lib64:/usr/local/lib \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  -e FI_EFA_FORK_SAFE=1 \
+  -e NCCL_SOCKET_IFNAME=enp71s0 \
+  -e NCCL_IB_HCA=rdmap \
+  -e NCCL_DEBUG=WARN \
+  -e HF_HOME=/root/.cache/huggingface \
+  -e OMP_NUM_THREADS=8 \
+  763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2 \
+  bash /train.sh \
+  > /opt/dlami/nvme/sdxl/train_node1.log 2>&1 &
+```
+
+### 训练参数
+
+| 参数 | 值 |
+|------|-----|
+| 基础模型 | stabilityai/stable-diffusion-xl-base-1.0 |
+| 数据集 | fusing/instructpix2pix-1000-samples（1000条） |
+| 分辨率 | 1024×1024 |
+| 每卡 batch size | 2 |
+| Gradient accumulation | 4 |
+| 有效 batch size | 2 × 16卡 × 4 = **128** |
+| 总训练步数 | 500 |
+| 学习率 | 5e-6，cosine scheduler，warmup 50步 |
+| 精度 | bf16 |
+| Checkpoint 间隔 | 每 100 步 |
+
+### 训练结果（2026-04-20 17:36 启动）
+
+```
+[RANK 0] ***** Running training *****
+  Num examples = 1000
+  Num Epochs = 63
+  Total train batch size = 128
+  Total optimization steps = 500
+
+step 1:  48.4s/it（warmup）
+step 10: 4.66s/it
+step 24: 4.11s/it（稳定）
+预计总时长：~35 分钟
+```
+
+### 监控
+
+```bash
+# 训练日志
+tail -f /opt/dlami/nvme/sdxl/train_node1.log
+
+# GPU 利用率
+nvidia-smi dmon -s u -d 5
+
+# Checkpoint
+ls -lh /opt/dlami/nvme/sdxl/checkpoints/
+```
+
+### 训练完成后同步到 S3
+
+```bash
+aws s3 sync /opt/dlami/nvme/sdxl/checkpoints/ s3://your-bucket/sdxl-checkpoints/ --region us-west-2
+```
+
+---
+
+## 六、故障排查
+
+### IBV_WC_REM_ACCESS_ERR（本次遇到并解决）
 
 ```
 NET/IB: Got completion from peer with status=IBV_WC_REM_ACCESS_ERR(10)
@@ -189,3 +357,7 @@ NET/IB: ibp198s0f0:1 async fatal event on QP: local access violation work queue 
 ### NCCL rendezvous timeout
 
 节点2必须在节点1启动后 15 分钟内完成连接。建议先启动节点2，再启动节点1。
+
+### pip install 不工作
+
+镜像内 pip 有 bug，使用 `python -m pip install` 替代 `pip install`。
