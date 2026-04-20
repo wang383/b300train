@@ -333,3 +333,106 @@ nohup docker run --rm \
 | `fi_info` 命令找不到 | 路径问题 | 使用 `/opt/amazon/efa/bin/fi_info` |
 | rendezvous timeout | 节点2启动太慢 | 先启动节点2，再启动节点1 |
 | pip install 不工作 | 镜像内 pip 有 bug | 使用 `python -m pip install` |
+
+---
+
+## 八、双机训练架构图
+
+```
+p6-b300 双机 16卡 DDP 训练架构
+═══════════════════════════════════════════════════════════════════════════════════════════
+
+  HuggingFace (SDXL Base 1.0 + Dataset)
+        │ model weights + dataset
+        ▼
+┌─────────────────────────────────────────┐        ┌─────────────────────────────────────────┐
+│  Node 1  172.31.47.177  (master)        │        │  Node 2  172.31.35.107                  │
+│  machine_rank=0                         │        │  machine_rank=1                         │
+│                                         │        │                                         │
+│  ┌─────────────────────────────────┐    │        │  ┌─────────────────────────────────┐    │
+│  │  8x NVIDIA B300 GPU (NVLink)    │    │        │  │  8x NVIDIA B300 GPU (NVLink)    │    │
+│  │                                 │    │        │  │                                 │    │
+│  │  [rank0] [rank1] [rank2] [rank3]│    │        │  │  [rank8] [rank9][rank10][rank11]│    │
+│  │  [rank4] [rank5] [rank6] [rank7]│    │        │  │ [rank12][rank13][rank14][rank15]│    │
+│  │  ◄────── NVLink all_reduce ────►│    │        │  │  ◄────── NVLink all_reduce ────►│    │
+│  └──────────────┬──────────────────┘    │        │  └──────────────┬──────────────────┘    │
+│                 │                       │        │                 │                       │
+│  ┌──────────────▼──────────────────┐    │        │  ┌──────────────▼──────────────────┐    │
+│  │  NCCL 2.28.9                    │    │        │  │  NCCL 2.28.9                    │    │
+│  │  ofi-nccl 1.19.0                │    │        │  │  ofi-nccl 1.19.0                │    │
+│  │  libfabric 2.4.0                │    │        │  │  libfabric 2.4.0                │    │
+│  └──────────────┬──────────────────┘    │        │  └──────────────┬──────────────────┘    │
+│                 │ EFA provider          │        │                 │ EFA provider          │
+│  ┌──────────────▼──────────────────┐    │        │  ┌──────────────▼──────────────────┐    │
+│  │  16x EFA NICs                   │◄───┼────────┼──┤  16x EFA NICs                   │    │
+│  │  rdmap86s0 ~ rdmap192s0         │    │        │  │  rdmap86s0 ~ rdmap192s0         │    │
+│  │  ~27 Gbps/NIC  Total ~438 Gbps  │────┼────────┼──►  ~27 Gbps/NIC  Total ~438 Gbps  │    │
+│  └──────────────┬──────────────────┘    │        │  └──────────────┬──────────────────┘    │
+│                 │                       │        │                 │                       │
+│  ┌──────────────▼──────────────────┐    │        │  ┌──────────────▼──────────────────┐    │
+│  │  ENA enp71s0                    │◄ ─ ┼ ─ ─ ─ ┼─ ┤  ENA enp71s0                    │    │
+│  │  rendezvous port 29500  (TCP)   │ ─ ─┼ ─ ─ ─ ┼──►  rendezvous port 29500  (TCP)   │    │
+│  └─────────────────────────────────┘    │        │  └─────────────────────────────────┘    │
+│                                         │        │                                         │
+│  NVMe /opt/dlami/nvme/sdxl/checkpoints  │        │  (no checkpoint, rank != 0)             │
+│  checkpoint-100/200/300/400/500         │        │                                         │
+└─────────────────────────────────────────┘        └─────────────────────────────────────────┘
+
+                    ◄──────── EFA RDMA Write all_reduce ────────►
+                         ~438 Gbps 双向  |  retrans=0  |  drops=0
+
+═══════════════════════════════════════════════════════════════════════════════════════════
+训练参数: SDXL instruct-pix2pix  |  batch=128 (16GPU×2×4)  |  500 steps  |  bf16  |  ~3s/it
+```
+
+---
+
+## 九、自定义 Docker 镜像（Dockerfile）
+
+完整 Dockerfile 见仓库根目录 `Dockerfile`，内容如下：
+
+```dockerfile
+FROM 763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-ec2
+
+# 复制 Ubuntu 22.04 专用的 EFA deb 包（libfabric 2.4.0 + ofi-nccl 1.19.0）
+# 从 aws-efa-installer-latest.tar.gz 的 DEBS/UBUNTU2204/x86_64/ 目录提取
+COPY libfabric1-aws_2.4.0amzn3.0_amd64.deb /tmp/
+COPY libfabric-aws-dev_2.4.0amzn3.0_amd64.deb /tmp/
+COPY libnccl-ofi_1.19.0-1_amd64.deb /tmp/
+
+# 安装（覆盖原有的 ofi-nccl，兼容容器内 glibc 2.35）
+RUN dpkg -i /tmp/libfabric1-aws_2.4.0amzn3.0_amd64.deb \
+            /tmp/libfabric-aws-dev_2.4.0amzn3.0_amd64.deb \
+            /tmp/libnccl-ofi_1.19.0-1_amd64.deb && \
+    rm /tmp/*.deb && ldconfig
+```
+
+### Build 步骤
+
+```bash
+# 1. 下载 EFA installer 并提取 Ubuntu 22.04 deb 包
+curl -fsSL https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz -o /tmp/efa-installer.tar.gz
+cd /tmp && tar -xzf efa-installer.tar.gz \
+  aws-efa-installer/DEBS/UBUNTU2204/x86_64/libfabric1-aws_2.4.0amzn3.0_amd64.deb \
+  aws-efa-installer/DEBS/UBUNTU2204/x86_64/libfabric-aws-dev_2.4.0amzn3.0_amd64.deb \
+  aws-efa-installer/DEBS/UBUNTU2204/x86_64/libnccl-ofi_1.19.0-1_amd64.deb
+cp aws-efa-installer/DEBS/UBUNTU2204/x86_64/*.deb ./docker-build/
+
+# 2. Build 镜像
+aws ecr get-login-password --region us-west-2 --profile myb300 | \
+  docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-west-2.amazonaws.com
+docker build -t pytorch-training-efa:2.10.0-cu130-ubuntu22.04 ./docker-build/
+
+# 3. Push 到私有 ECR
+ECR_URI="940482411881.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-efa:2.10.0-cu130-ubuntu22.04"
+aws ecr get-login-password --region us-west-2 --profile myb300 | \
+  docker login --username AWS --password-stdin 940482411881.dkr.ecr.us-west-2.amazonaws.com
+docker tag pytorch-training-efa:2.10.0-cu130-ubuntu22.04 $ECR_URI
+docker push $ECR_URI
+```
+
+### 镜像地址
+
+```
+940482411881.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-efa:2.10.0-cu130-ubuntu22.04
+```
